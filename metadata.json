@@ -1,0 +1,7 @@
+{
+  "name": "Galinhas Lucrativas",
+  "description": "Gestão inteligente de granjas, otimização de ração e consultoria financeira para avicultura.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
