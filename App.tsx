@@ -1,750 +1,847 @@
 
-import React, { useState, useRef, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { 
+  AppMode, 
+  FlockEntry, 
+  DailyNote, 
+  SubscriptionStatus, 
+  UserSettings, 
   Ingredient, 
   AnimalPhase, 
   FormulationResult, 
-  AppMode, 
-  VetDiagnosis, 
-  FinanceResult, 
-  FlockEntry,
-  Transaction,
-  CatalogItem,
-  TransactionType,
-  FlockResult,
-  DailyNote,
-  NutritionMode
+  Transaction, 
+  NutritionMode, 
+  FlockResult 
 } from './types';
-import { DEFAULT_INGREDIENTS, ANIMAL_PHASES } from './constants';
+import { supabase } from './lib/supabase';
+import { getErrorMessage } from './lib/utils';
 import { calculateFormulation } from './services/geminiService';
-import { diagnoseBirdHealth } from './services/veterinaryService';
-import { calculateFinance } from './services/financeService';
-import { registerFlock } from './services/flockService';
+import { registerFlock as generateFlockPlan } from './services/flockService';
+import { DEFAULT_INGREDIENTS, ANIMAL_PHASES } from './constants';
+
+// Componentes
 import IngredientInput from './components/IngredientInput';
 import ResultsDisplay from './components/ResultsDisplay';
-import VetReport from './components/VetReport';
-import FinanceReport from './components/FinanceReport';
+import SubscriptionGate from './components/SubscriptionGate';
 import FlockReport from './components/FlockReport';
-import DashboardCharts, { ConsumptionEfficiencyCard, MonthlyFinanceCard } from './components/DashboardCharts';
+import AdDisplay from './components/AdDisplay';
+import { MonthlyFinanceCard, ConsumptionEfficiencyCard } from './components/DashboardCharts';
+import { generateEggAd } from './services/adService';
 
-const INITIAL_CATALOG: CatalogItem[] = [
-  { id: 'cat-1', name: 'Dúzia de Ovos', unit: 'dz', basePrice: 12.00, type: 'venda' },
-  { id: 'cat-2', name: 'Esterco Seco', unit: 'saco', basePrice: 15.00, type: 'venda' },
-  { id: 'cat-3', name: 'Saco de Ração', unit: 'saco 40kg', basePrice: 120.00, type: 'compra' },
-  { id: 'cat-4', name: 'Milho Grão', unit: 'kg', basePrice: 1.50, type: 'compra' },
-];
+const DEFAULT_CATEGORIES = {
+  receita: ['Venda de Ovos', 'Venda de Aves', 'Venda de Esterco', 'Outros'],
+  despesa: ['Ração', 'Medicamentos', 'Mão de Obra', 'Energia Elétrica', 'Água', 'Manutenção', 'Transporte', 'Outros']
+};
 
 const App: React.FC = () => {
-  // --- Navigation & Context State ---
-  const [mode, setMode] = useState<AppMode>(AppMode.DASHBOARD);
-  const [financeSubMode, setFinanceSubMode] = useState<'caixa' | 'catalogo' | 'relatorio'>('caixa');
-  const [flockSubMode, setFlockSubMode] = useState<'lista' | 'novo' | 'diario'>('lista');
-  const [nutritionMode, setNutritionMode] = useState<NutritionMode>('formular_ia');
-  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [initializing, setInitializing] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [showAddNote, setShowAddNote] = useState(false);
+  const [showAddFlock, setShowAddFlock] = useState(false);
+  const [showAddTransaction, setShowAddTransaction] = useState(false);
+  const [financeFilter, setFinanceFilter] = useState<'todos' | 'receita' | 'despesa'>('todos');
+  const [dbError, setDbError] = useState<string | null>(null);
   
-  // --- Global App State ---
-  const [catalog, setCatalog] = useState<CatalogItem[]>(INITIAL_CATALOG);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [inventoryFlocks, setInventoryFlocks] = useState<FlockEntry[]>([
-    { id: '1', name: 'Lote A - 2024', quantity: 150, ageInWeeks: 22, arrivalDate: '2024-10-01', lineage: 'ISA Brown', status: 'normal' },
-  ]);
+  const [customCategories, setCustomCategories] = useState<{receita: string[], despesa: string[]}>(() => {
+    const saved = localStorage.getItem('gl_custom_cats');
+    return saved ? JSON.parse(saved) : { receita: [], despesa: [] };
+  });
+
+  const [transType, setTransType] = useState<'receita' | 'despesa'>('receita');
+  const [isAddingNewCat, setIsAddingNewCat] = useState(false);
+  const [newCatName, setNewCatName] = useState('');
+
+  const [subStatus, setSubStatus] = useState<SubscriptionStatus>(() => {
+    try {
+      const saved = localStorage.getItem('gl_sub_status');
+      if (!saved) return { isActive: false, tier: 'free' };
+      return JSON.parse(saved);
+    } catch { return { isActive: false, tier: 'free' }; }
+  });
+
+  const [userSettings, setUserSettings] = useState<UserSettings>({
+    farmName: 'Meu Criadouro', 
+    farmAddress: '', 
+    ownerName: 'Produtor', 
+    document: '', 
+    phone: '',
+    profileImage: ''
+  });
+
+  const [isEditingProfile, setIsEditingProfile] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  const [inventoryFlocks, setInventoryFlocks] = useState<FlockEntry[]>([]);
   const [dailyNotes, setDailyNotes] = useState<DailyNote[]>([]);
-
-  // --- Sync Form Dates with Global Selected Date ---
-  useEffect(() => {
-    if (!editingNoteId) {
-      setPostureForm(prev => ({ ...prev, date: selectedDate }));
-    }
-    if (!editingTransactionId) {
-      setTransForm(prev => ({ ...prev, date: selectedDate }));
-    }
-  }, [selectedDate]);
-
-  // --- Form States ---
-  const [editingCatalogId, setEditingCatalogId] = useState<string | null>(null);
-  const [catalogForm, setCatalogForm] = useState({ name: '', unit: '', price: 0, type: 'venda' as TransactionType });
-
-  const [editingFlockId, setEditingFlockId] = useState<string | null>(null);
-  const [flockForm, setFlockForm] = useState({ name: '', qty: 100, age: 1, lineage: 'ISA Brown', date: selectedDate });
-  const [loadingFlockInfo, setLoadingFlockInfo] = useState(false);
-  
-  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
-  const [selectedFlockId, setSelectedFlockId] = useState<string>(inventoryFlocks[0]?.id || '');
-  const [postureForm, setPostureForm] = useState({ eggs: 0, mortality: 0, notes: '', date: selectedDate });
-  
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>(DEFAULT_INGREDIENTS);
-  const [phase, setPhase] = useState<AnimalPhase>(AnimalPhase.GALINHAS_POSTURA);
-  const [loadingNutrition, setLoadingNutrition] = useState(false);
-  const [nutritionResult, setNutritionResult] = useState<FormulationResult | null>(null);
-  const [manualFormula, setManualFormula] = useState<{name: string, weight: number}[]>([]);
-  const [readyFeed, setReadyFeed] = useState({ price: 120, weight: 40 });
+  const [selectedPhase, setSelectedPhase] = useState<AnimalPhase>(AnimalPhase.GALINHAS_POSTURA);
+  const [formulationResult, setFormulationResult] = useState<FormulationResult | null>(null);
+  const [adResult, setAdResult] = useState<string | null>(null);
+  const [mode, setMode] = useState<AppMode>(AppMode.DASHBOARD);
+  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [daysElapsed, setDaysElapsed] = useState(1);
+  const [quickInput, setQuickInput] = useState('');
 
-  const [editingTransactionId, setEditingTransactionId] = useState<string | null>(null);
-  const [transForm, setTransForm] = useState({ itemId: '', qty: 1, date: selectedDate });
-  const [loadingFinance, setLoadingFinance] = useState(false);
-  const [financeResult, setFinanceResult] = useState<FinanceResult | null>(null);
+  // Estados para Ração Comercial
+  const [nutritionMode, setNutritionMode] = useState<NutritionMode>('formular_ia');
+  const [commercialBagPrice, setCommercialBagPrice] = useState<number>(0);
+  const [commercialBagWeight, setCommercialBagWeight] = useState<number>(50);
 
-  // --- Computed Metrics (Daily & Monthly) ---
-  const dashboardData = useMemo(() => {
-    const today = selectedDate;
-    const currentMonthPrefix = today.slice(0, 7); // YYYY-MM
+  useEffect(() => {
+    if (subStatus.isActive && subStatus.email) loadUserData(subStatus.email);
+    else setInitializing(false);
+  }, [subStatus.isActive, subStatus.email]);
 
-    // Daily Filters
-    const dayTransactions = transactions.filter(t => t.date === today);
-    const dayNotes = dailyNotes.filter(n => n.date === today);
+  useEffect(() => {
+    localStorage.setItem('gl_custom_cats', JSON.stringify(customCategories));
+  }, [customCategories]);
 
-    // Monthly Filters
-    const monthTransactions = transactions.filter(t => t.date.startsWith(currentMonthPrefix));
-    const monthNotes = dailyNotes.filter(n => n.date.startsWith(currentMonthPrefix));
-
-    // Daily Stats
-    const dailyRevenue = dayTransactions.filter(t => t.type === 'venda').reduce((acc, t) => acc + t.total, 0);
-    const dailyCosts = dayTransactions.filter(t => t.type !== 'venda').reduce((acc, t) => acc + t.total, 0);
-    const dailyEggs = dayNotes.reduce((acc, n) => acc + n.eggsCollected, 0);
-    const dailyFeedKg = dayNotes.reduce((acc, n) => acc + n.feedConsumedKg, 0);
-    const dailyProfit = dailyRevenue - dailyCosts;
-
-    // Monthly Stats
-    const monthlyRevenue = monthTransactions.filter(t => t.type === 'venda').reduce((acc, t) => acc + t.total, 0);
-    const monthlyCosts = monthTransactions.filter(t => t.type !== 'venda').reduce((acc, t) => acc + t.total, 0);
-    const monthlyEggs = monthNotes.reduce((acc, n) => acc + n.eggsCollected, 0);
-    const monthlyFeedKg = monthNotes.reduce((acc, n) => acc + n.feedConsumedKg, 0);
-
-    // Efficiency Metrics
-    const avgLayingRate = dayNotes.length > 0 
-      ? (dayNotes.reduce((acc, n) => acc + n.layingRate, 0) / dayNotes.length).toFixed(1)
-      : "0.0";
-    
-    const costPerEgg = dailyEggs > 0 ? (dailyCosts / dailyEggs) : 0;
-
-    return { 
-      daily: { revenue: dailyRevenue, costs: dailyCosts, profit: dailyProfit, eggs: dailyEggs, feedKg: dailyFeedKg, costPerEgg, layingRate: avgLayingRate },
-      monthly: { revenue: monthlyRevenue, costs: monthlyCosts, eggs: monthlyEggs, feedKg: monthlyFeedKg }
-    };
-  }, [transactions, dailyNotes, selectedDate]);
-
-  // --- HANDLERS ---
-  
-  const handleAddPostureRecord = () => {
-    const flock = inventoryFlocks.find(f => f.id === selectedFlockId);
-    if (!flock) return alert("Selecione um lote válido.");
-
-    if (postureForm.eggs > flock.quantity) {
-      alert(`⚠️ ERRO DE CONSISTÊNCIA\n\nA quantidade de ovos (${postureForm.eggs}) excede a quantidade de aves vivas (${flock.quantity}).`);
-      return;
-    }
-
-    const layingRate = flock.quantity > 0 ? (postureForm.eggs / flock.quantity) * 100 : 0;
-    const dailyGrams = flock.nutritionPlan?.feedConsumptionInfo.dailyPerBirdGrams || 115;
-    const estimatedFeed = (flock.quantity * dailyGrams) / 1000;
-
-    if (editingNoteId) {
-      setDailyNotes(dailyNotes.map(n => n.id === editingNoteId ? {
-        ...n,
-        date: postureForm.date,
-        flockId: flock.id,
-        flockName: flock.name,
-        eggsCollected: postureForm.eggs,
-        mortality: postureForm.mortality,
-        layingRate: parseFloat(layingRate.toFixed(1)),
-        notes: postureForm.notes
-      } : n));
-      setEditingNoteId(null);
-      alert("Registro de postura atualizado!");
-    } else {
-      const newNote: DailyNote = {
-        id: Math.random().toString(36).substr(2, 9),
-        date: postureForm.date,
-        flockId: flock.id,
-        flockName: flock.name,
-        eggsCollected: postureForm.eggs,
-        mortality: postureForm.mortality,
-        feedConsumedKg: estimatedFeed,
-        layingRate: parseFloat(layingRate.toFixed(1)),
-        feedConversion: postureForm.eggs > 0 ? estimatedFeed / (postureForm.eggs / 12) : 0,
-        notes: postureForm.notes
-      };
-      setDailyNotes([newNote, ...dailyNotes]);
-      if (postureForm.mortality > 0) {
-        setInventoryFlocks(inventoryFlocks.map(f => f.id === flock.id ? { ...f, quantity: Math.max(0, f.quantity - postureForm.mortality) } : f));
-      }
-      alert(`Postura registrada com sucesso!`);
-    }
-    setPostureForm({ eggs: 0, mortality: 0, notes: '', date: selectedDate });
-  };
-
-  const startEditDailyNote = (note: DailyNote) => {
-    setEditingNoteId(note.id);
-    setSelectedFlockId(note.flockId);
-    setPostureForm({
-      eggs: note.eggsCollected,
-      mortality: note.mortality,
-      notes: note.notes,
-      date: note.date
-    });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const deleteDailyNote = (id: string) => {
-    if (window.confirm("Deseja remover este registro de postura permanentemente?")) {
-      setDailyNotes(dailyNotes.filter(n => n.id !== id));
-      if (editingNoteId === id) {
-        setEditingNoteId(null);
-        setPostureForm({ eggs: 0, mortality: 0, notes: '', date: selectedDate });
-      }
-    }
-  };
-
-  const handleSaveFlock = async () => {
-    if (!flockForm.name || flockForm.qty <= 0) return alert("Preencha o nome e quantidade.");
-    
-    setLoadingFlockInfo(true);
+  const loadUserData = async (email: string) => {
+    setInitializing(true);
+    setDbError(null);
     try {
-      const nutritionPlan = await registerFlock(flockForm.date, flockForm.lineage, flockForm.qty, flockForm.age);
-      
-      if (editingFlockId) {
-        setInventoryFlocks(inventoryFlocks.map(f => f.id === editingFlockId ? { 
-          ...f, 
-          name: flockForm.name, 
-          quantity: flockForm.qty, 
-          ageInWeeks: flockForm.age, 
-          lineage: flockForm.lineage, 
-          arrivalDate: flockForm.date,
-          nutritionPlan
-        } : f));
-        setEditingFlockId(null);
-        alert("Lote e Plano Nutricional atualizados com sucesso!");
-      } else {
-        const newFlock: FlockEntry = {
-          id: Math.random().toString(36).substr(2, 9),
-          name: flockForm.name,
-          quantity: flockForm.qty,
-          ageInWeeks: flockForm.age,
-          lineage: flockForm.lineage,
-          arrivalDate: flockForm.date,
-          status: 'normal',
-          nutritionPlan
-        };
-        setInventoryFlocks([...inventoryFlocks, newFlock]);
-        alert("Novo lote cadastrado!");
+      const { data: profile } = await supabase.from('profiles').select('*').eq('email', email).maybeSingle();
+      if (profile) {
+        setUserSettings({
+          farmName: profile.farm_name || 'Meu Criadouro',
+          farmAddress: profile.farm_address || '',
+          ownerName: profile.owner_name || 'Produtor',
+          document: profile.document || '',
+          phone: profile.phone || '',
+          profileImage: profile.profile_image || ''
+        });
+        if (profile.created_at) {
+          const joined = new Date(profile.created_at);
+          const diff = Math.floor((new Date().getTime() - joined.getTime()) / (1000 * 60 * 60 * 24));
+          setDaysElapsed((diff % 30) + 1);
+        }
       }
-      setFlockForm({ name: '', qty: 100, age: 1, lineage: 'ISA Brown', date: selectedDate });
-      setFlockSubMode('lista');
-    } catch (e) {
-      alert("Erro ao processar plano nutricional.");
+
+      const { data: flocks } = await supabase.from('flocks').select('*').eq('user_email', email);
+      setInventoryFlocks((flocks || []).map(f => ({
+        id: f.id, name: f.name, quantity: f.quantity, ageInWeeks: f.age_in_weeks,
+        arrivalDate: f.arrival_date, lineage: f.lineage, nutritionPlan: f.nutrition_plan, status: 'normal'
+      })));
+
+      const { data: trans } = await supabase.from('transactions').select('*').eq('user_email', email).order('date', { ascending: false });
+      setTransactions(trans || []);
+
+      const { data: notes } = await supabase.from('daily_notes').select('*').eq('user_email', email).order('date', { ascending: false });
+      setDailyNotes((notes || []).map(n => ({
+        id: n.id, date: n.date, flockId: n.flock_id, flockName: 'Geral', eggsCollected: n.eggs_collected, mortality: n.mortality, feedConsumedKg: 0, layingRate: 0, feedConversion: 0, notes: n.notes || ''
+      })));
+
+    } catch (e) { 
+      setDbError(getErrorMessage(e));
+    } finally { 
+      setInitializing(false); 
+    }
+  };
+
+  const handleUpdateProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      const { error } = await supabase
+        .from('profiles')
+        .update({
+          farm_name: userSettings.farmName,
+          farm_address: userSettings.farmAddress,
+          owner_name: userSettings.ownerName,
+          phone: userSettings.phone,
+          profile_image: userSettings.profileImage,
+          updated_at: new Date().toISOString()
+        })
+        .eq('email', subStatus.email);
+
+      if (error) throw error;
+      setIsEditingProfile(false);
+      alert("Perfil atualizado com sucesso!");
+    } catch (err) {
+      alert("Erro ao salvar: " + getErrorMessage(err));
     } finally {
-      setLoadingFlockInfo(false);
+      setLoading(false);
     }
   };
 
-  const startEditFlock = (f: FlockEntry) => {
-    setEditingFlockId(f.id);
-    setFlockForm({
-      name: f.name,
-      qty: f.quantity,
-      age: f.ageInWeeks,
-      lineage: f.lineage,
-      date: f.arrivalDate
+  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setUserSettings(prev => ({ ...prev, profileImage: reader.result as string }));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleProcessQuickInput = () => {
+    if (!quickInput.trim()) return;
+    const lines = quickInput.split('\n');
+    const newIngredients = [...ingredients];
+    let updated = false;
+    lines.forEach(line => {
+      const match = line.match(/([a-zA-Z\s]+)[\s:]+(\d+[.,]\d+)/);
+      if (match) {
+        const name = match[1].trim();
+        const price = parseFloat(match[2].replace(',', '.'));
+        const index = newIngredients.findIndex(i => i.name.toLowerCase().includes(name.toLowerCase()) || name.toLowerCase().includes(i.name.toLowerCase()));
+        if (index !== -1) {
+          newIngredients[index] = { ...newIngredients[index], pricePerKg: price };
+          updated = true;
+        } else {
+          newIngredients.push({ id: Math.random().toString(36).substr(2, 9), name, pricePerKg: price });
+          updated = true;
+        }
+      }
     });
-    setFlockSubMode('novo');
-  };
-
-  const deleteFlock = (id: string) => {
-    if (window.confirm("Tem certeza que deseja remover este lote?")) {
-      setInventoryFlocks(inventoryFlocks.filter(f => f.id !== id));
-    }
-  };
-
-  const handleSaveCatalogItem = () => {
-    if (!catalogForm.name || catalogForm.price <= 0) return alert("Preencha o nome e um preço válido.");
-    if (editingCatalogId) {
-      setCatalog(catalog.map(item => item.id === editingCatalogId ? { ...item, ...catalogForm, basePrice: catalogForm.price } : item));
-      setEditingCatalogId(null);
+    if (updated) {
+      setIngredients(newIngredients);
+      setQuickInput('');
+      alert("Preços atualizados!");
     } else {
-      const newItem: CatalogItem = {
-        id: Math.random().toString(36).substr(2, 9),
-        name: catalogForm.name,
-        unit: catalogForm.unit,
-        basePrice: catalogForm.price,
-        type: catalogForm.type
-      };
-      setCatalog([...catalog, newItem]);
-    }
-    setCatalogForm({ name: '', unit: '', price: 0, type: 'venda' });
-  };
-
-  const startEditCatalog = (item: CatalogItem) => {
-    setEditingCatalogId(item.id);
-    setCatalogForm({ name: item.name, unit: item.unit, price: item.basePrice, type: item.type });
-  };
-
-  const deleteCatalogItem = (id: string) => {
-    if (window.confirm("Deseja remover este item?")) {
-      setCatalog(catalog.filter(i => i.id !== id));
+      alert("Formato: 'Milho 1.50'");
     }
   };
 
-  const handleCalculateNutrition = async () => {
-    setLoadingNutrition(true);
+  const handleDeleteTransaction = async (id: string) => {
+    if (!confirm("Deseja realmente excluir?")) return;
+    setLoading(true);
     try {
-      const res = await calculateFormulation(ingredients, phase);
-      setNutritionResult(res);
-    } catch (e) { console.error(e); } finally { setLoadingNutrition(false); }
-  };
-
-  const handleRunFinanceIA = async () => {
-    setLoadingFinance(true);
-    try {
-      const currentFlockTotal = inventoryFlocks.reduce((acc, f) => acc + f.quantity, 0);
-      const eggSellingPrice = catalog.find(c => c.id === 'cat-1')?.basePrice || 12;
-      const res = await calculateFinance(currentFlockTotal, dashboardData.daily.eggs, dashboardData.daily.costs, eggSellingPrice);
-      setFinanceResult(res);
-    } catch (e) { console.error(e); } finally { setLoadingFinance(false); }
-  };
-
-  const handleSaveTransaction = () => {
-    const item = catalog.find(i => i.id === transForm.itemId);
-    if (!item) return alert("Selecione um item.");
-    const total = item.basePrice * transForm.qty;
-    if (editingTransactionId) {
-      setTransactions(transactions.map(t => t.id === editingTransactionId ? { ...t, date: transForm.date, itemId: item.id, itemName: item.name, qty: transForm.qty, unit: item.unit, pricePerUnit: item.basePrice, total, type: item.type } : t));
-      setEditingTransactionId(null);
-    } else {
-      const newTrans: Transaction = {
-        id: Math.random().toString(36).substr(2, 9),
-        date: transForm.date,
-        itemId: item.id,
-        itemName: item.name,
-        qty: transForm.qty,
-        unit: item.unit,
-        pricePerUnit: item.basePrice,
-        total,
-        type: item.type
-      };
-      setTransactions([newTrans, ...transactions]);
-    }
-    setTransForm({ itemId: '', qty: 1, date: selectedDate });
-  };
-
-  const startEditTransaction = (t: Transaction) => {
-    setEditingTransactionId(t.id);
-    setTransForm({ itemId: t.itemId, qty: t.qty, date: t.date });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const deleteTransaction = (id: string) => {
-    if (window.confirm("Deseja excluir este lançamento?")) {
-      setTransactions(transactions.filter(t => t.id !== id));
+      const { error } = await supabase.from('transactions').delete().eq('id', id);
+      if (error) throw error;
+      await loadUserData(subStatus.email!);
+    } catch (err) {
+      alert(getErrorMessage(err));
+    } finally {
+      setLoading(false);
     }
   };
+
+  const handleAddNewCategory = () => {
+    if (!newCatName.trim()) return;
+    setCustomCategories(prev => ({
+      ...prev,
+      [transType]: [...new Set([...prev[transType], newCatName.trim()])]
+    }));
+    setNewCatName('');
+    setIsAddingNewCat(false);
+  };
+
+  const allCategories = useMemo(() => ({
+    receita: [...DEFAULT_CATEGORIES.receita, ...customCategories.receita],
+    despesa: [...DEFAULT_CATEGORIES.despesa, ...customCategories.despesa]
+  }), [customCategories]);
+
+  const financeStats = useMemo(() => {
+    const totalReceitas = transactions.filter(t => t.type === 'receita').reduce((acc, t) => acc + Number(t.total), 0);
+    const totalDespesas = transactions.filter(t => t.type === 'despesa').reduce((acc, t) => acc + Number(t.total), 0);
+    return { receitas: totalReceitas, despesas: totalDespesas, saldo: totalReceitas - totalDespesas };
+  }, [transactions]);
+
+  const filteredTransactions = useMemo(() => {
+    if (financeFilter === 'todos') return transactions;
+    return transactions.filter(t => t.type === financeFilter);
+  }, [transactions, financeFilter]);
+
+  const handleLogout = () => {
+    localStorage.removeItem('gl_sub_status');
+    setSubStatus({ isActive: false, tier: 'free' });
+  };
+
+  if (initializing) return <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center text-white font-black animate-pulse uppercase tracking-[0.5em] text-[10px]">🏠 Inicializando...</div>;
+  if (!subStatus.isActive) return <SubscriptionGate onUnlock={(email, tier) => { setSubStatus({ isActive: true, email, tier }); localStorage.setItem('gl_sub_status', JSON.stringify({ isActive: true, email, tier })); }} />;
 
   return (
-    <div className="min-h-screen pb-28 bg-[#F8FAFC] font-sans overflow-x-hidden">
-      {/* HEADER */}
-      <header className="bg-white border-b border-slate-200 px-4 md:px-6 py-4 sticky top-0 z-50 flex justify-between items-center shadow-sm">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 md:w-10 md:h-10 bg-slate-900 rounded-xl flex items-center justify-center text-xl shadow-lg">🐔</div>
-          <div className="flex flex-col">
-            <h1 className="text-lg md:text-xl font-black text-slate-900 tracking-tighter uppercase leading-none">Galinhas Lucrativas</h1>
-            <input 
-              type="date" 
-              value={selectedDate} 
-              onChange={(e) => setSelectedDate(e.target.value)} 
-              className="text-[9px] md:text-[10px] font-black text-indigo-600 uppercase tracking-widest bg-slate-50 px-2 py-0.5 mt-1 rounded-lg border border-indigo-100 outline-none cursor-pointer w-fit"
-            />
+    <div className="min-h-screen pb-32 bg-slate-50 font-sans selection:bg-indigo-100">
+      <header className="bg-white border-b border-slate-200 px-6 py-4 sticky top-0 z-50 shadow-sm">
+        <div className="max-w-6xl mx-auto flex justify-between items-center">
+          <div className="flex items-center gap-4">
+            <div className="w-10 h-10 bg-slate-900 rounded-xl flex items-center justify-center text-xl shadow-lg overflow-hidden border border-slate-100 text-white font-black">
+              {userSettings.profileImage ? <img src={userSettings.profileImage} className="w-full h-full object-cover" /> : "🏠"}
+            </div>
+            <div>
+              <h1 className="text-[11px] font-black text-slate-900 uppercase tracking-tighter leading-none">{userSettings.farmName}</h1>
+              <div className="flex items-center gap-2 mt-1">
+                <span className="w-1 h-1 bg-emerald-500 rounded-full"></span>
+                <p className="text-[7px] font-black text-slate-400 uppercase tracking-widest">{subStatus.tier} • {daysElapsed}/30 DIAS</p>
+              </div>
+            </div>
           </div>
+          {(mode === AppMode.DASHBOARD || mode === AppMode.FLOCK_GESTION) && (
+            <button onClick={() => setShowAddNote(true)} className="px-4 py-2.5 bg-indigo-600 text-white rounded-xl text-[9px] font-black uppercase tracking-widest shadow-lg active:scale-95 transition-all animate-in fade-in slide-in-from-right-4">Produção diária</button>
+          )}
         </div>
       </header>
 
-      {/* BOTTOM NAVIGATION - RESPONSIVE TABS */}
-      <nav className="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-xl border-t border-slate-200 px-2 py-2 md:py-3 z-[100] flex justify-around shadow-[0_-10px_25px_-10px_rgba(0,0,0,0.1)]">
+      <main className="max-w-6xl mx-auto p-4 md:p-8">
+        {dbError && (
+          <div className="mb-6 p-4 bg-rose-50 border border-rose-100 rounded-2xl text-rose-600 text-[10px] font-black uppercase tracking-widest leading-relaxed">
+            {dbError}
+          </div>
+        )}
+
+        {mode === AppMode.DASHBOARD && (
+          <div className="space-y-8 animate-in fade-in duration-500">
+            <div className="flex justify-between items-center">
+              <h2 className="text-2xl font-black uppercase italic tracking-tighter text-slate-900">Resumo Diário</h2>
+              <div className="flex gap-2">
+                <button onClick={() => { setTransType('receita'); setShowAddTransaction(true); }} className="bg-emerald-100 text-emerald-600 p-2 rounded-xl text-[10px] font-black uppercase tracking-tighter shadow-sm">+ Receita</button>
+                <button onClick={() => { setTransType('despesa'); setShowAddTransaction(true); }} className="bg-rose-100 text-rose-600 p-2 rounded-xl text-[10px] font-black uppercase tracking-tighter shadow-sm">+ Despesa</button>
+                <input type="date" value={selectedDate} onChange={e => setSelectedDate(e.target.value)} className="p-2 bg-white border border-slate-200 rounded-xl font-black text-[10px] uppercase shadow-sm outline-none" />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm text-center">
+                <p className="text-[8px] font-black text-slate-400 uppercase mb-2">Ovos Coletados</p>
+                <p className="text-4xl font-black text-indigo-600 tracking-tighter">{dailyNotes.filter(n => n.date === selectedDate).reduce((acc, n) => acc + n.eggsCollected, 0)}</p>
+              </div>
+              <div className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm text-center">
+                <p className="text-[8px] font-black text-slate-400 uppercase mb-2">Baixas</p>
+                <p className="text-4xl font-black text-rose-500 tracking-tighter">{dailyNotes.filter(n => n.date === selectedDate).reduce((acc, n) => acc + n.mortality, 0)}</p>
+              </div>
+              <div className="bg-slate-900 p-6 rounded-[2.5rem] shadow-xl text-center md:col-span-2 relative overflow-hidden flex flex-col justify-center">
+                <p className="text-[8px] font-black text-slate-500 uppercase mb-1 z-10">Plantel Total</p>
+                <p className="text-4xl font-black text-white tracking-tighter z-10">{inventoryFlocks.reduce((acc, f) => acc + f.quantity, 0)}</p>
+                <div className="absolute top-0 right-0 p-4 opacity-5 text-6xl">🐔</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <MonthlyFinanceCard revenue={financeStats.receitas} costs={financeStats.despesas} />
+              <ConsumptionEfficiencyCard feedKg={0} totalEggs={dailyNotes.filter(n => n.date === selectedDate).reduce((acc, n) => acc + n.eggsCollected, 0)} costPerEgg={0} />
+            </div>
+
+            <div className="pt-10 flex flex-col items-center">
+              <button 
+                onClick={async () => {
+                  setLoading(true);
+                  const ad = await generateEggAd("Caipira Orgânico");
+                  setAdResult(ad);
+                  setLoading(false);
+                }}
+                className="group relative flex items-center gap-4 bg-emerald-500 hover:bg-emerald-600 text-white px-8 py-4 rounded-3xl shadow-xl transition-all"
+              >
+                <span className="text-2xl">📢</span>
+                <div className="text-left">
+                  <p className="text-[9px] font-black uppercase tracking-widest opacity-80">Marketing IA</p>
+                  <p className="font-black uppercase tracking-tighter italic">Gerar Anúncio WhatsApp</p>
+                </div>
+              </button>
+              {adResult && <div className="mt-8 w-full"><AdDisplay adText={adResult} /></div>}
+            </div>
+          </div>
+        )}
+
+        {mode === AppMode.FINANCE && (
+          <div className="space-y-10 animate-in fade-in duration-500">
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+              <div>
+                <h2 className="text-2xl font-black uppercase italic tracking-tighter text-slate-900 leading-none">Financeiro</h2>
+                <p className="text-slate-400 font-black uppercase text-[8px] tracking-widest mt-2">Gestão de Entradas e Saídas</p>
+              </div>
+              <button onClick={() => { setTransType('receita'); setShowAddTransaction(true); }} className="bg-indigo-600 text-white px-6 py-3 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-xl active:scale-95 transition-transform">+ Nova Transação</button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="bg-emerald-600 text-white p-8 rounded-[2.5rem] shadow-xl relative overflow-hidden">
+                <span className="text-[9px] font-black uppercase opacity-60 tracking-widest mb-1 block">Receitas</span>
+                <p className="text-4xl font-black tracking-tighter">R$ {financeStats.receitas.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+              </div>
+              <div className="bg-rose-500 text-white p-8 rounded-[2.5rem] shadow-xl relative overflow-hidden">
+                <span className="text-[9px] font-black uppercase opacity-60 tracking-widest mb-1 block">Despesas</span>
+                <p className="text-4xl font-black tracking-tighter">R$ {financeStats.despesas.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+              </div>
+              <div className="bg-slate-900 text-white p-8 rounded-[2.5rem] shadow-xl relative overflow-hidden">
+                <span className="text-[9px] font-black uppercase opacity-60 tracking-widest mb-1 block">Saldo</span>
+                <p className="text-4xl font-black tracking-tighter">R$ {financeStats.saldo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-[2.5rem] border border-slate-200 shadow-sm overflow-hidden">
+              <div className="flex border-b border-slate-100 bg-slate-50 px-6 pt-6">
+                {[
+                  { id: 'todos', label: 'Todas' },
+                  { id: 'receita', label: 'Receitas' },
+                  { id: 'despesa', label: 'Despesas' },
+                ].map(tab => (
+                  <button key={tab.id} onClick={() => setFinanceFilter(tab.id as any)} className={`px-6 py-4 font-black uppercase text-[9px] tracking-widest relative ${financeFilter === tab.id ? 'text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}>
+                    {tab.label}
+                    {financeFilter === tab.id && <div className="absolute bottom-0 left-0 right-0 h-1 bg-indigo-600 rounded-t-full"></div>}
+                  </button>
+                ))}
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="text-[8px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-50">
+                      <th className="px-8 py-5">Data</th>
+                      <th className="px-8 py-5">Tipo</th>
+                      <th className="px-8 py-5">Item</th>
+                      <th className="px-8 py-5 text-right">Qtd</th>
+                      <th className="px-8 py-5 text-right">Vlr Unit</th>
+                      <th className="px-8 py-5 text-right">Total</th>
+                      <th className="px-8 py-5 text-center">Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50">
+                    {filteredTransactions.length === 0 ? (
+                      <tr><td colSpan={7} className="px-8 py-16 text-center text-slate-400 font-black uppercase text-[10px]">Nenhum registro encontrado</td></tr>
+                    ) : (
+                      filteredTransactions.map(t => (
+                        <tr key={t.id} className="hover:bg-slate-50/50 transition-colors group">
+                          <td className="px-8 py-5 font-bold text-slate-600 text-xs">{new Date(t.date).toLocaleDateString()}</td>
+                          <td className="px-8 py-5">
+                            <span className={`px-3 py-1 rounded-xl text-[8px] font-black uppercase tracking-tighter ${t.type === 'receita' ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>{t.type}</span>
+                          </td>
+                          <td className="px-8 py-5 font-black text-slate-700 text-[10px] uppercase">{t.item_name}</td>
+                          <td className="px-8 py-5 text-right text-slate-500 font-bold">{t.qty}</td>
+                          <td className="px-8 py-5 text-right text-slate-500 font-bold">R$ {Number(t.price_per_unit).toFixed(2)}</td>
+                          <td className={`px-8 py-5 text-right font-black text-sm ${t.type === 'receita' ? 'text-emerald-600' : 'text-rose-500'}`}>
+                            R$ {Number(t.total).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                          </td>
+                          <td className="px-8 py-5 text-center">
+                            <button onClick={() => handleDeleteTransaction(t.id)} className="text-slate-300 hover:text-rose-500 transition-colors opacity-0 group-hover:opacity-100">
+                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {mode === AppMode.FLOCK_GESTION && (
+          <div className="space-y-10 animate-in fade-in duration-500">
+            <div className="flex justify-between items-center">
+              <h2 className="text-2xl font-black uppercase italic tracking-tighter text-slate-900 leading-none">Meus Lotes</h2>
+              <button onClick={() => setShowAddFlock(true)} className="bg-slate-900 text-white px-5 py-3 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-xl hover:scale-105 transition-transform">+ Novo Lote</button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {inventoryFlocks.length === 0 ? (
+                <div className="col-span-full py-24 text-center bg-white border border-dashed border-slate-300 rounded-[2.5rem]">
+                  <p className="text-slate-400 font-black uppercase text-[10px] tracking-widest">Nenhum lote registrado</p>
+                </div>
+              ) : (
+                inventoryFlocks.map(flock => (
+                  <div key={flock.id} className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm hover:shadow-xl transition-all cursor-pointer group">
+                    <div className="flex justify-between items-start mb-6">
+                      <div>
+                        <h3 className="text-lg font-black text-slate-900 uppercase tracking-tighter group-hover:text-indigo-600 transition-colors">{flock.name}</h3>
+                        <p className="text-[9px] font-bold text-slate-400 uppercase mt-1 tracking-widest">{flock.lineage}</p>
+                      </div>
+                      <div className="bg-indigo-50 text-indigo-600 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase">{flock.ageInWeeks} SEM</div>
+                    </div>
+                    <p className="text-[10px] font-black text-slate-500 uppercase">👤 {flock.quantity} Aves</p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {mode === AppMode.NUTRITION && (
+          <div className="space-y-10 animate-in fade-in duration-500">
+            <h2 className="text-2xl font-black uppercase italic tracking-tighter text-indigo-600 leading-none">Nutrição</h2>
+            
+            <div className="flex border-b border-slate-200 bg-white rounded-t-[2rem] px-6 pt-4">
+              {[
+                { id: 'racao_propria', label: 'Ração Própria' },
+                { id: 'formular_ia', label: 'Formulação do App' },
+                { id: 'racao_comercial', label: 'Ração Comercial' },
+              ].map(tab => (
+                <button 
+                  key={tab.id} 
+                  onClick={() => setNutritionMode(tab.id as NutritionMode)} 
+                  className={`px-6 py-4 font-black uppercase text-[9px] tracking-widest relative ${nutritionMode === tab.id ? 'text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}
+                >
+                  {tab.label}
+                  {nutritionMode === tab.id && <div className="absolute bottom-0 left-0 right-0 h-1 bg-indigo-600 rounded-t-full"></div>}
+                </button>
+              ))}
+            </div>
+
+            {nutritionMode === 'racao_comercial' ? (
+              <div className="bg-white p-10 rounded-[2.5rem] border border-slate-200 shadow-xl space-y-8 animate-in zoom-in-95">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Valor da Saca (R$)</label>
+                    <input 
+                      type="number" 
+                      value={commercialBagPrice} 
+                      onChange={e => setCommercialBagPrice(Number(e.target.value))} 
+                      className="w-full p-4 bg-slate-50 border-2 border-orange-400 rounded-2xl font-black text-slate-700 outline-none focus:ring-4 focus:ring-orange-100 transition-all" 
+                      placeholder="0,00"
+                    />
+                  </div>
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Peso da Saca (Kg)</label>
+                    <input 
+                      type="number" 
+                      value={commercialBagWeight} 
+                      onChange={e => setCommercialBagWeight(Number(e.target.value))} 
+                      className="w-full p-4 bg-slate-50 border-2 border-slate-100 rounded-2xl font-black text-slate-700 outline-none focus:border-indigo-400 transition-all" 
+                      placeholder="50"
+                    />
+                  </div>
+                </div>
+                
+                <div className="pt-6 border-t border-slate-100 flex flex-col items-center">
+                   <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 text-center">Valor Calculado por Kg</p>
+                   <p className="text-6xl font-black text-indigo-600 tracking-tighter">
+                     R$ {commercialBagWeight > 0 ? (commercialBagPrice / commercialBagWeight).toFixed(2) : "0.00"}
+                   </p>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="relative group">
+                  <textarea 
+                    value={quickInput} 
+                    onChange={(e) => setQuickInput(e.target.value)} 
+                    placeholder="Cole os preços aqui. Ex: Milho 1.30, Soja 2.90..." 
+                    className="w-full p-8 bg-slate-900 text-indigo-300 rounded-[2.5rem] font-bold text-sm border-4 border-slate-800 focus:border-indigo-500 outline-none transition-all placeholder:text-slate-700 min-h-[140px]" 
+                  />
+                  {quickInput.trim() && (
+                    <button 
+                      onClick={handleProcessQuickInput}
+                      className="absolute bottom-4 right-4 bg-indigo-600 text-white px-6 py-3 rounded-2xl font-black uppercase text-[9px] tracking-widest shadow-xl active:scale-95 transition-transform"
+                    >
+                      Processar Lista
+                    </button>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-10">
+                  <div className="lg:col-span-4 space-y-6">
+                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-xl space-y-6">
+                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Fase Alvo</p>
+                      <select value={selectedPhase} onChange={e => setSelectedPhase(e.target.value as AnimalPhase)} className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl font-black text-xs uppercase outline-none focus:ring-2 focus:ring-indigo-500">
+                        {ANIMAL_PHASES.map(p => <option key={p} value={p}>{p}</option>)}
+                      </select>
+                      {nutritionMode === 'formular_ia' && (
+                        <button onClick={async () => { setLoading(true); const res = await calculateFormulation(ingredients, selectedPhase); setFormulationResult(res); setLoading(false); }} disabled={loading} className="w-full py-5 bg-slate-900 text-white rounded-xl font-black uppercase text-[10px] tracking-widest shadow-xl disabled:opacity-50">
+                          {loading ? 'Consultando IA...' : 'Formular com IA'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="lg:col-span-8 space-y-4">
+                    <div className="space-y-3">
+                      {ingredients.map(ing => (
+                        <IngredientInput key={ing.id} ingredient={ing} onRemove={id => setIngredients(ingredients.filter(i => i.id !== id))} onChange={(id, f, v) => setIngredients(ingredients.map(i => i.id === id ? {...i, [f]: v} : i))} />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                {formulationResult && nutritionMode === 'formular_ia' && <ResultsDisplay result={formulationResult} />}
+              </>
+            )}
+          </div>
+        )}
+
+        {mode === AppMode.SETTINGS && (
+          <div className="max-w-xl mx-auto space-y-8 pt-6 animate-in fade-in duration-500">
+            <div className="flex justify-between items-center mb-4">
+               <h2 className="text-2xl font-black uppercase italic tracking-tighter text-slate-900 leading-none">Configurações</h2>
+               {!isEditingProfile && (
+                 <button onClick={() => setIsEditingProfile(true)} className="text-[10px] font-black text-indigo-600 uppercase tracking-widest underline decoration-2 underline-offset-4">Editar Perfil</button>
+               )}
+            </div>
+
+            <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-8 flex flex-col items-center">
+              <div 
+                className={`w-32 h-32 bg-slate-900 rounded-[3rem] flex items-center justify-center text-5xl shadow-2xl text-white overflow-hidden border-4 border-white relative group ${isEditingProfile ? 'cursor-pointer' : ''}`}
+                onClick={() => isEditingProfile && fileInputRef.current?.click()}
+              >
+                {userSettings.profileImage ? (
+                  <img src={userSettings.profileImage} className="w-full h-full object-cover" />
+                ) : (
+                  "👨‍🌾"
+                )}
+                {isEditingProfile && (
+                  <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                    <span className="text-white text-xs font-black uppercase text-[8px]">Alterar Foto</span>
+                  </div>
+                )}
+                <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handlePhotoUpload} />
+              </div>
+
+              {isEditingProfile ? (
+                <form onSubmit={handleUpdateProfile} className="w-full space-y-5">
+                  <div className="space-y-2">
+                    <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Nome do Criatório</label>
+                    <input 
+                      value={userSettings.farmName} 
+                      onChange={e => setUserSettings(prev => ({ ...prev, farmName: e.target.value }))}
+                      className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold text-slate-700 outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Responsável</label>
+                    <input 
+                      value={userSettings.ownerName} 
+                      onChange={e => setUserSettings(prev => ({ ...prev, ownerName: e.target.value }))}
+                      className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold text-slate-700 outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Endereço / Localização</label>
+                    <input 
+                      value={userSettings.farmAddress} 
+                      onChange={e => setUserSettings(prev => ({ ...prev, farmAddress: e.target.value }))}
+                      className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold text-slate-700 outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Contato / WhatsApp</label>
+                    <input 
+                      value={userSettings.phone} 
+                      onChange={e => setUserSettings(prev => ({ ...prev, phone: e.target.value }))}
+                      className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold text-slate-700 outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div className="flex gap-4 pt-4">
+                    <button type="button" onClick={() => setIsEditingProfile(false)} className="flex-1 py-4 bg-slate-100 text-slate-500 rounded-2xl font-black uppercase text-[10px] tracking-widest">Cancelar</button>
+                    <button type="submit" disabled={loading} className="flex-1 py-4 bg-indigo-600 text-white rounded-2xl font-black uppercase text-[10px] tracking-widest shadow-lg">
+                      {loading ? 'Salvando...' : 'Salvar Alterações'}
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <div className="text-center w-full space-y-6">
+                  <div className="space-y-1">
+                    <p className="font-black text-2xl text-slate-900 uppercase tracking-tighter">{userSettings.farmName}</p>
+                    <p className="text-slate-400 font-bold text-xs uppercase tracking-widest">{userSettings.ownerName}</p>
+                  </div>
+                  <div className="bg-slate-50 rounded-3xl p-6 text-left space-y-4 border border-slate-100">
+                     <div>
+                       <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">Localização</span>
+                       <p className="text-xs font-bold text-slate-700">{userSettings.farmAddress || 'Não informado'}</p>
+                     </div>
+                     <div>
+                       <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">WhatsApp</span>
+                       <p className="text-xs font-bold text-indigo-600">{userSettings.phone || 'Não informado'}</p>
+                     </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-900 p-8 rounded-[2.5rem] shadow-xl text-white space-y-6">
+               <div className="flex justify-between items-center">
+                 <h3 className="text-xs font-black uppercase tracking-widest opacity-60">Plano & Assinatura</h3>
+                 <span className="bg-emerald-500 px-3 py-1 rounded-full text-[9px] font-black uppercase">ATIVO</span>
+               </div>
+               <div className="space-y-2">
+                  <p className="text-2xl font-black tracking-tighter leading-tight uppercase italic">{subStatus.tier} Premium</p>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase leading-relaxed">
+                    Faltam <span className="text-white">{30 - daysElapsed} dias</span> para finalizar sua assinatura.
+                  </p>
+               </div>
+               <div className="space-y-4 pt-2">
+                  <button 
+                    onClick={() => window.open('https://hotmart.com/pt-br/club/login', '_blank')}
+                    className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl font-black uppercase text-[10px] tracking-widest transition-all shadow-lg"
+                  >
+                    Gerenciar na Hotmart
+                  </button>
+                  <button 
+                    onClick={() => { if(confirm("Deseja realmente cancelar sua assinatura? Você perderá acesso às funcionalidades premium.")) window.open('https://help.hotmart.com/pt-BR/article/como-cancelar-uma-assinatura/115002183968', '_blank'); }}
+                    className="w-full text-center text-[9px] font-black text-slate-500 hover:text-rose-500 uppercase tracking-widest transition-colors py-2"
+                  >
+                    Cancelar Assinatura
+                  </button>
+               </div>
+            </div>
+
+            {!isEditingProfile && (
+              <button onClick={handleLogout} className="w-full py-5 bg-rose-50 text-rose-600 rounded-[2rem] font-black uppercase text-[10px] tracking-widest border border-rose-100 hover:bg-rose-100 transition-colors">Sair da Conta</button>
+            )}
+          </div>
+        )}
+      </main>
+
+      <nav className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-xl border-t border-slate-200 px-2 py-4 flex justify-around shadow-[0_-10px_40px_rgba(0,0,0,0.05)] z-50 rounded-t-[2.5rem]">
         {[
-          { id: AppMode.DASHBOARD, label: 'Resumo', icon: '🏠' },
-          { id: AppMode.FLOCK_GESTION, label: 'Lotes', icon: '🐓' },
+          { id: AppMode.DASHBOARD, label: 'Início', icon: '🏠' },
+          { id: AppMode.FLOCK_GESTION, label: 'Lotes', icon: '🐣' },
           { id: AppMode.NUTRITION, label: 'Ração', icon: '🌽' },
-          { id: AppMode.FINANCE, label: 'Finanças', icon: '💰' },
+          { id: AppMode.FINANCE, label: 'Financeiro', icon: '💰' },
+          { id: AppMode.SETTINGS, label: 'Perfil', icon: '⚙️' },
         ].map(tab => (
-          <button 
-            key={tab.id} 
-            onClick={() => setMode(tab.id as AppMode)} 
-            className={`flex flex-col items-center justify-center gap-1 flex-1 py-1 rounded-2xl transition-all duration-300 ${mode === tab.id ? 'text-indigo-600 bg-indigo-50/50' : 'text-slate-400 hover:text-slate-600'}`}
-          >
-            <span className="text-2xl md:text-3xl">{tab.icon}</span>
-            <span className="text-[9px] md:text-[10px] font-black uppercase tracking-tighter">{tab.label}</span>
+          <button key={tab.id} onClick={() => setMode(tab.id as AppMode)} className={`flex flex-col items-center flex-1 py-2 rounded-2xl transition-all ${mode === tab.id ? 'text-indigo-600 bg-indigo-50 font-black scale-110 shadow-sm' : 'text-slate-400'}`}>
+            <span className="text-xl mb-1">{tab.icon}</span>
+            <span className="text-[7px] uppercase font-black tracking-widest">{tab.label}</span>
           </button>
         ))}
       </nav>
 
-      <main className="max-w-6xl mx-auto p-4 md:p-8 space-y-8 md:space-y-10">
-        
-        {/* DASHBOARD - RELATÓRIOS AVANÇADOS */}
-        {mode === AppMode.DASHBOARD && (
-          <div className="space-y-8 md:space-y-10 animate-in fade-in duration-500">
-            <h2 className="text-xl md:text-2xl font-black text-slate-900 tracking-tighter uppercase">Inteligência de Negócio</h2>
-            
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-6">
-              <div className="bg-white p-5 md:p-8 rounded-[2.5rem] md:rounded-[3rem] border border-slate-200 shadow-sm">
-                <p className="text-[8px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Ovos Hoje</p>
-                <p className="text-2xl md:text-4xl font-black text-indigo-600 tracking-tighter">{dashboardData.daily.eggs}</p>
-              </div>
-              <div className="bg-white p-5 md:p-8 rounded-[2.5rem] md:rounded-[3rem] border border-slate-200 shadow-sm">
-                <p className="text-[8px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Taxa de Postura</p>
-                <p className="text-2xl md:text-4xl font-black text-slate-900 tracking-tighter">{dashboardData.daily.layingRate}%</p>
-              </div>
-              <div className="bg-white p-5 md:p-8 rounded-[2.5rem] md:rounded-[3rem] border border-slate-200 shadow-sm">
-                <p className="text-[8px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Consumo Ração</p>
-                <p className="text-2xl md:text-4xl font-black text-amber-600 tracking-tighter">{dashboardData.daily.feedKg.toFixed(1)} <span className="text-xs">kg</span></p>
-              </div>
-              <div className="bg-emerald-50 p-5 md:p-8 rounded-[2.5rem] md:rounded-[3rem] border border-emerald-100 shadow-sm col-span-1">
-                <p className="text-[8px] md:text-[10px] font-black text-emerald-600 uppercase tracking-widest mb-1">Lucro Dia</p>
-                <p className="text-2xl md:text-4xl font-black text-emerald-700 tracking-tighter">R$ {dashboardData.daily.profit.toFixed(0)}</p>
-              </div>
+      {/* MODAL DE TRANSAÇÃO */}
+      {showAddTransaction && (
+        <div className="fixed inset-0 z-[1001] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl animate-in zoom-in-95 overflow-hidden flex flex-col">
+            <div className="px-8 py-6 flex justify-between items-center border-b border-slate-100">
+              <h2 className="text-xl font-black text-slate-800 tracking-tight italic uppercase">Nova Transação</h2>
+              <button onClick={() => setShowAddTransaction(false)} className="text-slate-400 text-2xl hover:text-slate-600">&times;</button>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 md:gap-8">
-              <div className="lg:col-span-7 space-y-6 md:space-y-8">
-                <MonthlyFinanceCard 
-                  revenue={dashboardData.monthly.revenue} 
-                  costs={dashboardData.monthly.costs} 
-                />
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              if (loading) return;
+              setLoading(true);
+              try {
+                const fd = new FormData(e.currentTarget);
+                const qty = Number(fd.get('qty') || 1);
+                const unitPrice = Number(fd.get('price'));
+                const itemName = fd.get('item_name') as string || (fd.get('category') as string);
                 
-                <div className="bg-white p-6 md:p-10 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm">
-                  <DashboardCharts type="pie" revenue={dashboardData.daily.revenue} costs={dashboardData.daily.costs} />
-                </div>
-              </div>
+                const payload = {
+                  user_email: subStatus.email!,
+                  type: transType,
+                  item_name: itemName,
+                  qty: qty,
+                  price_per_unit: unitPrice,
+                  total: qty * unitPrice,
+                  date: fd.get('date') as string
+                };
 
-              <div className="lg:col-span-5 space-y-6 md:space-y-8">
-                <ConsumptionEfficiencyCard 
-                  feedKg={dashboardData.daily.feedKg} 
-                  totalEggs={dashboardData.daily.eggs} 
-                  costPerEgg={dashboardData.daily.costPerEgg}
-                />
-
-                <div className="bg-indigo-600 p-8 md:p-10 rounded-[2.5rem] md:rounded-[4rem] text-white shadow-xl relative overflow-hidden group cursor-pointer hover:bg-indigo-700 transition-colors" onClick={() => { setMode(AppMode.FINANCE); setFinanceSubMode('relatorio'); }}>
-                  <div className="relative z-10">
-                    <h3 className="text-[9px] md:text-[10px] font-black text-indigo-300 uppercase tracking-widest mb-2">Consultoria Avançada</h3>
-                    <p className="text-xl md:text-2xl font-black leading-tight mb-4 tracking-tighter">Gere seu relatório detalhado de eficiência IA.</p>
-                    <div className="flex items-center gap-2 text-indigo-200 font-bold text-sm">
-                      Acessar análise <span className="group-hover:translate-x-1 transition-transform">→</span>
-                    </div>
-                  </div>
-                  <div className="absolute top-0 right-0 p-8 opacity-10 text-6xl">📊</div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* FLOCK GESTION */}
-        {mode === AppMode.FLOCK_GESTION && (
-          <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex gap-1.5 p-1 bg-white border border-slate-200 rounded-3xl w-full md:w-fit mx-auto shadow-sm overflow-x-auto no-scrollbar">
-               {[
-                 { id: 'lista', label: 'Plantel', icon: '📋' },
-                 { id: 'novo', label: editingFlockId ? 'Editar' : 'Novo', icon: editingFlockId ? '✎' : '➕' },
-                 { id: 'diario', label: 'Postura', icon: '🥚' }
-               ].map(sub => (
-                 <button key={sub.id} onClick={() => {
-                   setFlockSubMode(sub.id as any);
-                   if (sub.id !== 'novo') setEditingFlockId(null);
-                 }} className={`flex-1 md:flex-none py-2 md:py-3 px-4 md:px-6 rounded-2xl text-[9px] md:text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap ${flockSubMode === sub.id ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-50'}`}>
-                   {sub.label}
-                 </button>
-               ))}
-            </div>
-
-            {flockSubMode === 'lista' && (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 md:gap-8">
-                {inventoryFlocks.map(flock => (
-                  <div key={flock.id} className="bg-white p-8 md:p-10 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm relative overflow-hidden group hover:border-indigo-200 transition-all flex flex-col h-full">
-                    <div className="absolute top-0 right-0 p-6 opacity-5 group-hover:scale-110 transition-transform">🐓</div>
-                    <div className="flex justify-between items-start mb-4">
-                      <h3 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tighter">{flock.name}</h3>
-                      <div className="flex gap-2 relative z-10">
-                        <button onClick={() => startEditFlock(flock)} className="p-2 bg-slate-50 text-indigo-600 rounded-xl hover:bg-indigo-50 transition-colors shadow-sm" title="Editar Lote">✎</button>
-                        <button onClick={() => deleteFlock(flock.id)} className="p-2 bg-slate-50 text-rose-500 rounded-xl hover:bg-rose-50 transition-colors shadow-sm" title="Excluir Lote">✕</button>
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3 md:gap-4 mb-6">
-                       <div className="bg-slate-50 p-4 md:p-5 rounded-3xl">
-                          <p className="text-[8px] font-black text-slate-400 uppercase">Aves</p>
-                          <p className="text-lg md:text-xl font-black text-indigo-600">{flock.quantity}</p>
-                       </div>
-                       <div className="bg-slate-50 p-4 md:p-5 rounded-3xl">
-                          <p className="text-[8px] font-black text-slate-400 uppercase">Idade</p>
-                          <p className="text-lg md:text-xl font-black text-slate-800">{flock.ageInWeeks} sem</p>
-                       </div>
-                    </div>
-                    {flock.nutritionPlan && (
-                      <div className="bg-indigo-50/50 p-5 md:p-6 rounded-3xl border border-indigo-100 flex-1 flex flex-col justify-between">
-                        <div>
-                          <p className="text-[8px] font-black text-indigo-400 uppercase mb-3 tracking-widest">Nutrição Atual</p>
-                          <div className="space-y-2">
-                            <div className="flex justify-between items-center"><span className="text-[9px] md:text-[10px] font-bold text-slate-600">Tipo:</span><span className="text-[10px] md:text-xs font-black text-indigo-700 uppercase">{flock.nutritionPlan.feedConsumptionInfo.currentFeedType}</span></div>
-                            <div className="flex justify-between items-center"><span className="text-[9px] md:text-[10px] font-bold text-slate-600">Consumo/Dia:</span><span className="text-xs md:text-sm font-black text-slate-900">{flock.nutritionPlan.feedConsumptionInfo.dailyPerBirdGrams}g</span></div>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {flockSubMode === 'novo' && (
-              <div className="max-w-2xl mx-auto bg-white p-8 md:p-12 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm space-y-6 md:space-y-8">
-                <h2 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tighter uppercase text-center">{editingFlockId ? 'Editar Lote' : 'Novo Lote'}</h2>
-                <div className="space-y-4">
-                   <div className="space-y-1">
-                      <label className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase ml-4">Nome do Lote</label>
-                      <input type="text" placeholder="Ex: Lote B - 2024" value={flockForm.name} onChange={e => setFlockForm({...flockForm, name: e.target.value})} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none focus:ring-2 focus:ring-indigo-500" />
-                   </div>
-                   <div className="grid grid-cols-2 gap-4">
-                      <div className="space-y-1">
-                        <label className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase ml-4">Quantidade</label>
-                        <input type="number" value={flockForm.qty} onChange={e => setFlockForm({...flockForm, qty: parseInt(e.target.value) || 0})} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none" />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase ml-4">Idade (Semanas)</label>
-                        <input type="number" value={flockForm.age} onChange={e => setFlockForm({...flockForm, age: parseInt(e.target.value) || 0})} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none" />
-                      </div>
-                   </div>
-                   <div className="space-y-1">
-                      <label className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase ml-4">Linhagem</label>
-                      <input type="text" value={flockForm.lineage} onChange={e => setFlockForm({...flockForm, lineage: e.target.value})} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none" />
-                   </div>
-                   <button onClick={handleSaveFlock} disabled={loadingFlockInfo} className="w-full py-6 md:py-8 bg-slate-900 text-white rounded-2xl md:rounded-[2.5rem] font-black uppercase text-[10px] md:text-xs tracking-widest shadow-xl hover:bg-black transition-all">
-                      {loadingFlockInfo ? 'Analisando...' : 'Salvar e Gerar Plano IA'}
-                   </button>
-                </div>
-              </div>
-            )}
-
-            {flockSubMode === 'diario' && (
-              <div className="max-w-3xl mx-auto space-y-8">
-                <div className="bg-white p-8 md:p-12 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm space-y-6 md:space-y-8">
-                  <h2 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tighter uppercase text-center">Registro de Postura</h2>
-                  <div className="space-y-4">
-                    <input type="date" value={postureForm.date} onChange={e => setPostureForm({...postureForm, date: e.target.value})} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none focus:ring-2 focus:ring-indigo-500" />
-                    <select value={selectedFlockId} onChange={e => setSelectedFlockId(e.target.value)} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none appearance-none">
-                      {inventoryFlocks.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
-                    </select>
-                    <div className="grid grid-cols-2 gap-4">
-                      <input type="number" placeholder="Ovos" value={postureForm.eggs} onChange={e => setPostureForm({...postureForm, eggs: parseInt(e.target.value) || 0})} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black" />
-                      <input type="number" placeholder="Mortes" value={postureForm.mortality} onChange={e => setPostureForm({...postureForm, mortality: parseInt(e.target.value) || 0})} className="w-full p-4 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black text-rose-500" />
-                    </div>
-                    <button onClick={handleAddPostureRecord} className="w-full py-6 md:py-8 bg-slate-900 text-white rounded-2xl md:rounded-[2.5rem] font-black uppercase text-[10px] md:text-xs tracking-widest shadow-xl">Salvar Diário</button>
-                  </div>
-                </div>
-                <div className="bg-white p-6 md:p-8 rounded-[2rem] md:rounded-[3rem] border border-slate-200 shadow-sm overflow-hidden">
-                   <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6 px-2">Histórico Recente</h3>
-                   <div className="space-y-3 max-h-[400px] overflow-y-auto no-scrollbar">
-                      {dailyNotes.length > 0 ? dailyNotes.map(note => (
-                        <div key={note.id} className="p-4 md:p-5 border border-slate-100 rounded-2xl md:rounded-3xl flex justify-between items-center bg-slate-50/50 hover:bg-white transition-all group">
-                           <div>
-                              <p className="font-black text-slate-900 text-sm md:text-base">{note.flockName}</p>
-                              <p className="text-[9px] md:text-[10px] font-bold text-slate-400 uppercase tracking-tighter">{note.date.split('-').reverse().join('/')}</p>
-                           </div>
-                           <div className="flex items-center gap-4 md:gap-6">
-                              <div className="text-center"><p className="text-lg md:text-xl font-black text-indigo-600">{note.eggsCollected}</p><p className="text-[8px] font-black text-slate-400 uppercase">Ovos</p></div>
-                              <button onClick={() => deleteDailyNote(note.id)} className="p-2 text-rose-400 opacity-60 md:opacity-0 group-hover:opacity-100 transition-all hover:bg-rose-50 rounded-lg">✕</button>
-                           </div>
-                        </div>
-                      )) : <p className="text-center py-10 opacity-30 uppercase font-black text-xs">Sem registros</p>}
-                   </div>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* NUTRITION */}
-        {mode === AppMode.NUTRITION && (
-          <div className="space-y-6 md:space-y-8 animate-in fade-in duration-500">
-            <div className="flex gap-1.5 p-1 bg-white border border-slate-200 rounded-3xl w-full md:w-fit mx-auto shadow-sm overflow-x-auto no-scrollbar">
-               {[
-                 { id: 'formular_ia', label: '🤖 IA Nutri', icon: '🤖' },
-                 { id: 'minha_formula', label: '✍️ Receita', icon: '✍️' },
-                 { id: 'racao_pronta', label: '🛍️ Comercial', icon: '🛍️' }
-               ].map(sub => (
-                 <button key={sub.id} onClick={() => setNutritionMode(sub.id as any)} className={`flex-1 md:flex-none py-2 md:py-3 px-4 md:px-6 rounded-2xl text-[9px] md:text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap ${nutritionMode === sub.id ? 'bg-emerald-600 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-50'}`}>
-                   {sub.label}
-                 </button>
-               ))}
-            </div>
-
-            {nutritionMode === 'formular_ia' && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 md:gap-10">
-                <div className="lg:col-span-5 bg-white p-8 md:p-10 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm space-y-6 md:space-y-8">
-                  <h2 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tighter uppercase">Mix Nutricional IA</h2>
-                  <div className="space-y-3">
-                    {ingredients.map(ing => (
-                      <IngredientInput key={ing.id} ingredient={ing} onRemove={id => setIngredients(ingredients.filter(i => i.id !== id))} onChange={(id, f, v) => setIngredients(ingredients.map(i => i.id === id ? {...i, [f]: v} : i))} />
-                    ))}
-                    <button onClick={() => setIngredients([...ingredients, { id: Math.random().toString(), name: '', pricePerKg: 0 }])} className="w-full py-4 border-2 border-dashed border-slate-200 rounded-2xl text-[9px] md:text-[10px] font-black uppercase text-slate-400 hover:bg-slate-50">Adicionar Insumo</button>
-                  </div>
-                  <button onClick={handleCalculateNutrition} disabled={loadingNutrition} className="w-full py-6 md:py-8 bg-emerald-600 text-white rounded-2xl md:rounded-[2.5rem] font-black uppercase text-[10px] md:text-xs tracking-widest shadow-2xl transition-all">
-                    {loadingNutrition ? 'Analisando...' : 'Calcular Mix Ideal'}
+                const { error } = await supabase.from('transactions').insert([payload]);
+                if (error) throw error;
+                setShowAddTransaction(false);
+                await loadUserData(subStatus.email!);
+              } catch (err) {
+                alert(getErrorMessage(err));
+              } finally {
+                setLoading(false);
+              }
+            }} className="p-8 space-y-6">
+              
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Tipo</label>
+                <div className="grid grid-cols-2 gap-4">
+                  <button type="button" onClick={() => setTransType('receita')} className={`flex flex-col items-center justify-center gap-2 p-6 rounded-2xl border-2 transition-all ${transType === 'receita' ? 'border-emerald-500 bg-emerald-50 text-emerald-600' : 'border-slate-100 bg-white text-slate-400 opacity-60'}`}>
+                    <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" /></svg>
+                    <span className="font-black uppercase text-[10px] tracking-widest">Receita</span>
+                  </button>
+                  <button type="button" onClick={() => setTransType('despesa')} className={`flex flex-col items-center justify-center gap-2 p-6 rounded-2xl border-2 transition-all ${transType === 'despesa' ? 'border-rose-500 bg-rose-50 text-rose-600' : 'border-slate-100 bg-white text-slate-400 opacity-60'}`}>
+                    <svg className="w-6 h-6 rotate-180" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" /></svg>
+                    <span className="font-black uppercase text-[10px] tracking-widest">Despesa</span>
                   </button>
                 </div>
-                <div className="lg:col-span-7">
-                  {nutritionResult ? <ResultsDisplay result={nutritionResult} /> : (
-                    <div className="h-full flex flex-col items-center justify-center opacity-30 py-16 md:py-20 text-center border-2 border-dashed border-slate-200 rounded-[2.5rem] md:rounded-[4rem]">
-                      <div className="w-24 h-24 md:w-32 md:h-32 bg-slate-200 rounded-full flex items-center justify-center text-4xl md:text-5xl mb-6">🌽</div>
-                      <p className="font-black uppercase tracking-widest text-[10px] md:text-xs max-w-xs">Otimize custos com IA nutricional.</p>
-                    </div>
-                  )}
-                </div>
               </div>
-            )}
 
-            {nutritionMode === 'minha_formula' && (
-              <div className="max-w-2xl mx-auto bg-white p-8 md:p-12 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm space-y-6 md:space-y-8 animate-in slide-in-from-bottom-4">
-                <h2 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tighter text-center uppercase">Minha Receita</h2>
-                <div className="space-y-4">
-                  {manualFormula.length === 0 && <p className="text-center text-slate-400 italic text-sm py-4">Sua receita está vazia.</p>}
-                  {manualFormula.map((item, idx) => (
-                    <div key={idx} className="flex gap-2">
-                      <input type="text" placeholder="Ingrediente" value={item.name} onChange={e => {
-                        const next = [...manualFormula];
-                        next[idx].name = e.target.value;
-                        setManualFormula(next);
-                      }} className="flex-1 p-4 bg-slate-50 border border-slate-200 rounded-xl font-black outline-none" />
-                      <input type="number" placeholder="kg" value={item.weight} onChange={e => {
-                        const next = [...manualFormula];
-                        next[idx].weight = parseFloat(e.target.value) || 0;
-                        setManualFormula(next);
-                      }} className="w-20 md:w-24 p-4 bg-slate-50 border border-slate-200 rounded-xl font-black outline-none" />
-                      <button onClick={() => setManualFormula(manualFormula.filter((_, i) => i !== idx))} className="p-3 text-rose-400">✕</button>
-                    </div>
-                  ))}
-                  <button onClick={() => setManualFormula([...manualFormula, {name: '', weight: 0}])} className="w-full py-4 border-2 border-dashed border-slate-200 rounded-xl text-[10px] font-black uppercase text-slate-400">Adicionar</button>
-                  <button onClick={() => alert("Receita Salva!")} className="w-full py-6 bg-slate-900 text-white rounded-[2rem] font-black uppercase text-xs tracking-widest">Salvar</button>
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Categoria</label>
+                  <button type="button" onClick={() => setIsAddingNewCat(!isAddingNewCat)} className="text-[10px] font-black text-indigo-600 uppercase tracking-widest">+ Nova</button>
                 </div>
+                {isAddingNewCat ? (
+                  <div className="flex gap-2">
+                    <input autoFocus value={newCatName} onChange={e => setNewCatName(e.target.value)} placeholder="NOME DA CATEGORIA" className="flex-1 p-4 bg-white border-2 border-indigo-400 rounded-2xl font-bold text-slate-700 outline-none" />
+                    <button type="button" onClick={handleAddNewCategory} className="bg-indigo-600 text-white px-4 rounded-2xl font-black uppercase text-[10px]">OK</button>
+                  </div>
+                ) : (
+                  <select name="category" required className="w-full p-4 bg-white border-2 border-orange-400 rounded-2xl font-bold text-slate-700 outline-none">
+                    <option value="">Selecione uma categoria</option>
+                    {allCategories[transType].map(cat => (
+                      <option key={cat} value={cat}>{cat}</option>
+                    ))}
+                  </select>
+                )}
               </div>
-            )}
 
-            {nutritionMode === 'racao_pronta' && (
-              <div className="max-w-2xl mx-auto bg-white p-8 md:p-12 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm space-y-6 md:space-y-8 animate-in slide-in-from-bottom-4">
-                <h2 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tighter text-center uppercase">Comercial</h2>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
-                  <div className="space-y-1">
-                    <label className="text-[9px] font-black text-slate-400 uppercase ml-4">Preço do Saco (R$)</label>
-                    <input type="number" value={readyFeed.price} onChange={e => setReadyFeed({...readyFeed, price: parseFloat(e.target.value) || 0})} className="w-full p-5 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none" />
-                  </div>
-                  <div className="space-y-1">
-                    <label className="text-[9px] font-black text-slate-400 uppercase ml-4">Peso (kg)</label>
-                    <input type="number" value={readyFeed.weight} onChange={e => setReadyFeed({...readyFeed, weight: parseFloat(e.target.value) || 0})} className="w-full p-5 md:p-6 bg-slate-50 border border-slate-200 rounded-2xl md:rounded-[2rem] font-black outline-none" />
-                  </div>
-                </div>
-                <div className="bg-emerald-50 p-8 md:p-10 rounded-[2rem] md:rounded-[3rem] text-center border border-emerald-100 shadow-inner">
-                  <p className="text-[9px] md:text-[10px] font-black text-emerald-600 uppercase tracking-widest mb-1">Custo Real por Quilo</p>
-                  <p className="text-4xl md:text-6xl font-black text-emerald-800 tracking-tighter">R$ {(readyFeed.price / (readyFeed.weight || 1)).toFixed(2)}</p>
-                </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Valor (R$)</label>
+                <input name="price" type="number" step="0.01" required placeholder="0" className="w-full p-4 bg-white border-2 border-slate-100 rounded-2xl font-black text-slate-700 outline-none focus:border-indigo-400" />
               </div>
-            )}
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Data</label>
+                <input name="date" type="date" required className="w-full p-4 bg-white border-2 border-slate-100 rounded-2xl font-bold text-slate-700 outline-none" defaultValue={new Date().toISOString().split('T')[0]} />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Descrição</label>
+                <textarea name="description" placeholder="Detalhes sobre a transação..." className="w-full p-4 bg-white border-2 border-slate-100 rounded-2xl font-medium text-slate-600 outline-none min-h-[80px] resize-none" />
+              </div>
+
+              <div className="flex gap-4 pt-4">
+                <button type="button" onClick={() => setShowAddTransaction(false)} className="flex-1 py-4 bg-white border-2 border-slate-100 text-slate-400 rounded-2xl font-black uppercase text-[10px] tracking-widest">Cancelar</button>
+                <button type="submit" disabled={loading} className={`flex-1 py-4 text-white rounded-2xl font-black uppercase text-[10px] tracking-widest shadow-xl transition-all ${transType === 'receita' ? 'bg-emerald-500' : 'bg-rose-500'}`}>
+                  {loading ? 'Processando...' : 'Salvar'}
+                </button>
+              </div>
+            </form>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* FINANCE */}
-        {mode === AppMode.FINANCE && (
-          <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex gap-1.5 p-1 bg-white border border-slate-200 rounded-3xl w-full md:w-fit mx-auto shadow-sm overflow-x-auto no-scrollbar">
-               {[
-                 { id: 'caixa', label: 'Caixa', icon: '📝' },
-                 { id: 'catalogo', label: 'Catálogo', icon: '🏷️' },
-                 { id: 'relatorio', label: '📊 Consultoria', icon: '📊' }
-               ].map(sub => (
-                 <button key={sub.id} onClick={() => setFinanceSubMode(sub.id as any)} className={`flex-1 md:flex-none py-2 md:py-3 px-4 md:px-6 rounded-2xl text-[9px] md:text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap ${financeSubMode === sub.id ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 hover:bg-slate-50'}`}>
-                   {sub.label}
-                 </button>
-               ))}
-            </div>
-
-            {financeSubMode === 'caixa' && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 md:gap-8">
-                <div className="lg:col-span-5 bg-white p-8 md:p-10 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm space-y-6">
-                  <h2 className="text-2xl font-black text-slate-900 tracking-tighter uppercase">Lançamento</h2>
-                  <div className="space-y-4">
-                    <input type="date" value={transForm.date} onChange={e => setTransForm({...transForm, date: e.target.value})} className="w-full p-4 md:p-5 bg-slate-50 border border-slate-200 rounded-xl md:rounded-2xl font-black outline-none" />
-                    <select value={transForm.itemId} onChange={e => setTransForm({...transForm, itemId: e.target.value})} className="w-full p-4 md:p-5 bg-slate-50 border border-slate-200 rounded-xl md:rounded-2xl font-black outline-none appearance-none">
-                      <option value="">O que aconteceu?</option>
-                      {catalog.map(i => <option key={i.id} value={i.id}>{i.name}</option>)}
-                    </select>
-                    <input type="number" value={transForm.qty} onChange={e => setTransForm({...transForm, qty: parseFloat(e.target.value) || 0})} placeholder="Quantidade" className="w-full p-4 md:p-5 bg-slate-50 border border-slate-200 rounded-xl md:rounded-2xl font-black outline-none" />
-                    <button onClick={handleSaveTransaction} className="w-full py-5 md:py-6 bg-emerald-600 text-white rounded-xl md:rounded-2xl font-black uppercase text-xs tracking-widest shadow-xl">Confirmar</button>
-                  </div>
-                </div>
-                <div className="lg:col-span-7 bg-white border border-slate-200 rounded-[2.5rem] md:rounded-[4rem] overflow-hidden shadow-sm h-[400px] md:h-[500px] overflow-y-auto no-scrollbar">
-                   <div className="p-6 md:p-8 space-y-4">
-                      {transactions.filter(t => t.date === selectedDate).map(t => (
-                        <div key={t.id} className="p-4 md:p-6 bg-slate-50 border border-slate-100 rounded-2xl md:rounded-3xl flex justify-between items-center group hover:bg-white hover:shadow-md transition-all">
-                          <div className="min-w-0 flex-1 mr-2">
-                            <p className="font-black text-slate-900 truncate text-sm md:text-base">{t.itemName}</p>
-                            <p className="text-[9px] text-slate-400 font-bold uppercase">{t.qty} {t.unit}</p>
-                          </div>
-                          <div className="flex items-center gap-3 md:gap-4">
-                            <p className={`text-base md:text-xl font-black whitespace-nowrap ${t.type === 'venda' ? 'text-emerald-600' : 'text-rose-600'}`}>R$ {t.total.toFixed(2)}</p>
-                            <button onClick={() => deleteTransaction(t.id)} className="p-2 text-rose-400 opacity-60 md:opacity-0 group-hover:opacity-100 transition-all">✕</button>
-                          </div>
-                        </div>
-                      ))}
-                      {transactions.filter(t => t.date === selectedDate).length === 0 && <p className="text-center py-20 opacity-30 font-black uppercase text-xs">Sem movimentos</p>}
-                   </div>
-                </div>
+      {/* MODAL DE PRODUÇÃO DIÁRIA */}
+      {showAddNote && (
+        <div className="fixed inset-0 z-[1001] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white w-full max-w-lg rounded-[2.5rem] p-10 shadow-2xl animate-in zoom-in-95">
+            <h2 className="text-xl font-black uppercase tracking-tighter italic text-slate-900 mb-6">Registrar Produção Diária</h2>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              const { error } = await supabase.from('daily_notes').insert({ 
+                user_email: subStatus.email, 
+                date: fd.get('date'), 
+                eggs_collected: parseInt(fd.get('eggs') as string), 
+                mortality: parseInt(fd.get('mortality') as string) 
+              });
+              if (!error) { setShowAddNote(false); loadUserData(subStatus.email!); }
+              else alert(getErrorMessage(error));
+            }} className="space-y-4">
+              <input name="date" type="date" required className="w-full p-4 bg-slate-50 border rounded-xl font-black text-xs uppercase" defaultValue={new Date().toISOString().split('T')[0]} />
+              <div className="grid grid-cols-2 gap-4">
+                <input name="eggs" type="number" required placeholder="OVOS" className="w-full p-5 bg-slate-50 border rounded-xl font-black text-xl text-center" />
+                <input name="mortality" type="number" required placeholder="MORTES" className="w-full p-5 bg-slate-50 border rounded-xl font-black text-xl text-center" />
               </div>
-            )}
-
-            {financeSubMode === 'catalogo' && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 md:gap-8">
-                <div className="lg:col-span-5 bg-white p-8 md:p-10 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm space-y-6">
-                  <h2 className="text-2xl font-black text-slate-900 tracking-tighter uppercase">{editingCatalogId ? 'Editar' : 'Novo Item'}</h2>
-                  <div className="space-y-4">
-                    <input type="text" placeholder="Nome" value={catalogForm.name} onChange={e => setCatalogForm({...catalogForm, name: e.target.value})} className="w-full p-4 md:p-5 bg-slate-50 border border-slate-200 rounded-xl md:rounded-2xl font-black outline-none" />
-                    <div className="grid grid-cols-2 gap-4">
-                      <input type="text" placeholder="Unid." value={catalogForm.unit} onChange={e => setCatalogForm({...catalogForm, unit: e.target.value})} className="w-full p-4 md:p-5 bg-slate-50 border border-slate-200 rounded-xl md:rounded-2xl font-black" />
-                      <input type="number" placeholder="Preço" value={catalogForm.price} onChange={e => setCatalogForm({...catalogForm, price: parseFloat(e.target.value) || 0})} className="w-full p-4 md:p-5 bg-slate-50 border border-slate-200 rounded-xl md:rounded-2xl font-black" />
-                    </div>
-                    <select value={catalogForm.type} onChange={e => setCatalogForm({...catalogForm, type: e.target.value as any})} className="w-full p-4 md:p-5 bg-slate-50 border border-slate-200 rounded-xl md:rounded-2xl font-black outline-none">
-                      <option value="venda">Receita (Venda)</option>
-                      <option value="compra">Custo (Compra)</option>
-                    </select>
-                    <button onClick={handleSaveCatalogItem} className="w-full py-5 md:py-6 bg-slate-900 text-white rounded-xl md:rounded-2xl font-black uppercase text-xs tracking-widest transition-all">
-                      {editingCatalogId ? 'Salvar' : 'Adicionar'}
-                    </button>
-                  </div>
-                </div>
-                <div className="lg:col-span-7 bg-white p-6 md:p-10 rounded-[2.5rem] md:rounded-[4rem] border border-slate-200 shadow-sm max-h-[500px] overflow-y-auto no-scrollbar">
-                  {catalog.map(item => (
-                    <div key={item.id} className="p-4 md:p-5 border border-slate-100 rounded-2xl md:rounded-3xl flex justify-between items-center mb-2 group hover:bg-slate-50 transition-colors">
-                      <div className="min-w-0 flex-1 mr-2"><p className="font-black text-slate-800 truncate text-sm md:text-base">{item.name}</p><p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">{item.unit}</p></div>
-                      <div className="flex items-center gap-3 md:gap-4">
-                        <p className="text-base md:text-lg font-black text-slate-900 whitespace-nowrap">R$ {item.basePrice.toFixed(2)}</p>
-                        <button onClick={() => startEditCatalog(item)} className="p-2 text-indigo-500">✎</button>
-                        <button onClick={() => deleteCatalogItem(item.id)} className="p-2 text-rose-400">✕</button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {financeSubMode === 'relatorio' && (
-              <div className="space-y-6 md:space-y-8">
-                 <button onClick={handleRunFinanceIA} disabled={loadingFinance} className="w-full py-6 md:py-8 bg-indigo-600 text-white rounded-2xl md:rounded-[2rem] font-black uppercase text-xs md:text-sm tracking-widest shadow-2xl">
-                    {loadingFinance ? 'Consultando IA...' : 'Analisar Desempenho Biológico'}
-                 </button>
-                 {financeResult && <FinanceReport report={financeResult} />}
-              </div>
-            )}
+              <button type="submit" className="w-full py-5 bg-indigo-600 text-white rounded-2xl font-black uppercase text-[10px] tracking-widest shadow-xl">Salvar Registro</button>
+              <button type="button" onClick={() => setShowAddNote(false)} className="w-full text-slate-400 font-black uppercase text-[9px] tracking-widest mt-4">Cancelar</button>
+            </form>
           </div>
-        )}
+        </div>
+      )}
 
-      </main>
-
-      <footer className="max-w-6xl mx-auto mt-10 md:mt-20 p-6 md:p-10 text-center border-t border-slate-100 opacity-30 pb-10">
-         <p className="text-[9px] md:text-[10px] font-black uppercase tracking-[0.3em] md:tracking-[0.5em]">Galinhas Lucrativas • Gestão de Alta Performance</p>
-      </footer>
+      {/* MODAL DE LOTE */}
+      {showAddFlock && (
+        <div className="fixed inset-0 z-[1001] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white w-full max-w-lg rounded-[2.5rem] p-10 shadow-2xl animate-in zoom-in-95">
+            <h2 className="text-xl font-black uppercase tracking-tighter italic text-slate-900 mb-6 text-center">Novo Lote</h2>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              setLoading(true);
+              const fd = new FormData(e.currentTarget);
+              const plan = await generateFlockPlan(fd.get('arrival') as string, fd.get('lineage') as string, Number(fd.get('qty')), Number(fd.get('age')));
+              const { error } = await supabase.from('flocks').insert({ 
+                user_email: subStatus.email, name: fd.get('name'), quantity: Number(fd.get('qty')), age_in_weeks: Number(fd.get('age')), arrival_date: fd.get('arrival'), lineage: fd.get('lineage'), nutrition_plan: plan 
+              });
+              if (!error) { setShowAddFlock(false); loadUserData(subStatus.email!); }
+              else alert(getErrorMessage(error));
+              setLoading(false);
+            }} className="space-y-4">
+              <input name="name" placeholder="NOME DO LOTE" required className="w-full p-4 bg-slate-50 border rounded-xl font-black text-xs uppercase" />
+              <div className="grid grid-cols-2 gap-4">
+                <input name="qty" type="number" placeholder="AVES" required className="w-full p-4 bg-slate-50 border rounded-xl font-black text-xs uppercase" />
+                <input name="age" type="number" placeholder="SEMANAS" required className="w-full p-4 bg-slate-50 border rounded-xl font-black text-xs uppercase" />
+              </div>
+              <input name="lineage" placeholder="RAÇA / LINHAGEM" required className="w-full p-4 bg-slate-50 border rounded-xl font-black text-xs uppercase" />
+              <input name="arrival" type="date" required className="w-full p-4 bg-slate-50 border rounded-xl font-black text-xs uppercase" defaultValue={new Date().toISOString().split('T')[0]} />
+              <button type="submit" disabled={loading} className="w-full py-5 bg-slate-900 text-white rounded-2xl font-black uppercase text-[10px] tracking-widest shadow-xl disabled:opacity-50">{loading ? 'Gerando Plano IA...' : 'Criar Lote'}</button>
+              <button type="button" onClick={() => setShowAddFlock(false)} className="w-full text-slate-400 font-black uppercase text-[9px] tracking-widest mt-4">Cancelar</button>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

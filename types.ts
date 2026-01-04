@@ -36,27 +36,18 @@ export interface FinanceResult {
   }[];
 }
 
-export type TransactionType = 'venda' | 'compra' | 'servico';
-
-export interface CatalogItem {
-  id: string;
-  name: string;
-  unit: string;
-  basePrice: number;
-  type: TransactionType;
-}
+export type TransactionType = 'receita' | 'despesa';
 
 export interface Transaction {
   id: string;
-  date: string;
-  itemId: string;
-  itemName: string;
-  qty: number;
-  unit: string;
-  pricePerUnit: number;
-  total: number;
+  user_email: string;
   type: TransactionType;
-  notes?: string;
+  item_name: string;
+  qty: number;
+  price_per_unit: number;
+  total: number;
+  date: string;
+  created_at?: string;
 }
 
 export interface DailyNote {
@@ -72,13 +63,6 @@ export interface DailyNote {
   notes: string;
 }
 
-export interface VaccineScheduleItem {
-  week: number;
-  date: string;
-  vaccine: string;
-  method: string;
-}
-
 export interface FlockResult {
   summary: string;
   estimatedLayingDate: string;
@@ -92,18 +76,9 @@ export interface FlockResult {
     targetFeedType: string;
     description: string;
   };
-  vaccinationSchedule: VaccineScheduleItem[];
+  vaccinationSchedule: any[];
   biosecurityProtocols: string[];
   healthAlerts: string[];
-}
-
-export interface BiosecurityResult {
-  cumulativeMortalityRate: number;
-  isRedAlert: boolean;
-  liveBirdsRemaining: number;
-  probableCauses: string[];
-  analysis: string;
-  emergencyProcedures: string[];
 }
 
 export interface FlockEntry {
@@ -117,23 +92,14 @@ export interface FlockEntry {
   nutritionPlan?: FlockResult;
 }
 
-export enum AppMode {
-  DASHBOARD = "DASHBOARD",
-  FLOCK_GESTION = "FLOCK_GESTION",
-  NUTRITION = "NUTRITION",
-  HEALTH_HANDLING = "HEALTH_HANDLING",
-  FINANCE = "FINANCE"
+export interface BiosecurityResult {
+  cumulativeMortalityRate: number;
+  isRedAlert: boolean;
+  liveBirdsRemaining: number;
+  probableCauses: string[];
+  analysis: string;
+  emergencyProcedures: string[];
 }
-
-export enum AnimalPhase {
-  GALINHAS_INICIAL = "Galinhas (Pintinhos/Inicial)",
-  GALINHAS_RECRIA = "Galinhas (Recria/Crescimento)",
-  GALINHAS_POSTURA = "Galinhas (Postura/Produção)",
-  CODORNAS_INICIAL = "Codornas (Inicial)",
-  CODORNAS_POSTURA = "Codornas (Postura/Produção)"
-}
-
-export type NutritionMode = 'formular_ia' | 'minha_formula' | 'racao_pronta';
 
 export interface InventoryResult {
   totalBirds: number;
@@ -167,4 +133,38 @@ export interface HandlingResult {
     lightingHours: string;
   };
   expertNote: string;
+}
+
+export enum AppMode {
+  DASHBOARD = "DASHBOARD",
+  FLOCK_GESTION = "FLOCK_GESTION",
+  NUTRITION = "NUTRITION",
+  FINANCE = "FINANCE",
+  SETTINGS = "SETTINGS"
+}
+
+export enum AnimalPhase {
+  GALINHAS_INICIAL = "Galinhas (Pintinhos/Inicial)",
+  GALINHAS_RECRIA = "Galinhas (Recria/Crescimento)",
+  GALINHAS_POSTURA = "Galinhas (Postura/Produção)",
+  CODORNAS_INICIAL = "Codornas (Inicial)",
+  CODORNAS_POSTURA = "Codornas (Postura/Produção)"
+}
+
+export type NutritionMode = 'formular_ia' | 'racao_propria' | 'racao_comercial';
+
+export interface SubscriptionStatus {
+  isActive: boolean;
+  email?: string;
+  expiryDate?: string;
+  tier: 'free' | 'premium' | 'admin';
+}
+
+export interface UserSettings {
+  farmName: string;
+  farmAddress: string;
+  ownerName: string;
+  document: string;
+  phone: string;
+  profileImage?: string;
 }
