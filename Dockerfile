@@ -3,8 +3,9 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 COPY . .
-# Gera a versão final para a internet
 RUN npm run build
+# Instalamos um servidor leve para entregar os arquivos
+RUN npm install -g serve
 EXPOSE 8080
-# Usa o comando 'serve' para entregar os arquivos da pasta 'dist'
-CMD ["npx", "serve", "-s", "dist", "-l", "8080"]
+# Comando para rodar o site da pasta 'dist' na porta do Google
+CMD ["serve", "-s", "dist", "-l", "8080"]
