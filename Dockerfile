@@ -3,8 +3,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 COPY . .
-# Gera a pasta dist com os arquivos do site
+# Gera a versão final para a internet
 RUN npm run build
 EXPOSE 8080
-# Comando que usamos no package.json
-CMD ["npm", "start"]
+# Usa o comando 'serve' para entregar os arquivos da pasta 'dist'
+CMD ["npx", "serve", "-s", "dist", "-l", "8080"]
